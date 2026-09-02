@@ -37,7 +37,7 @@ jobs:
         id: check
         run: |
           TENANCY="${{ secrets.OCI_CLI_TENANCY }}"
-          EXISTING=$(oci compute instance list --compartment-id "$TENANCY" --all --query "data[?display_name=='vm-arm' && lifecycle_state=='RUNNING'] | length(@)" --raw-output 2>/dev/null || echo "0")
+          EXISTING=$(oci compute instance list --compartment-id "$TENANCY" --all --query 'data[?"display-name"==`vm-arm` && "lifecycle-state"==`RUNNING`] | length(@)' --raw-output 2>/dev/null || echo "0")
           if [ "$EXISTING" != "0" ]; then
             echo "exists=true" >> $GITHUB_OUTPUT
             echo "vm-arm already running, skipping"
@@ -54,7 +54,7 @@ jobs:
             --compartment-id "$TENANCY" \
             --shape VM.Standard.A1.Flex \
             --all \
-            --query "data[?contains(display_name,'Canonical-Ubuntu-24.04-aarch64') && !contains(display_name,'Minimal')] | sort_by(@, &time-created) | [-1].id" \
+            --query 'data[?contains("display-name",`Canonical-Ubuntu-24.04-aarch64`) && !contains("display-name",`Minimal`)] | sort_by(@, &"time-created") | [-1].id' \
             --raw-output)
           echo "image_id=$IMAGE_ID" >> $GITHUB_OUTPUT
           echo "Selected image: $IMAGE_ID"
@@ -136,7 +136,7 @@ jobs:
 
           # Wait for RUNNING state
           for i in $(seq 1 60); do
-            STATE=$(oci compute instance get --instance-id "$INSTANCE_ID" --query 'data.lifecycle_state' --raw-output 2>/dev/null)
+            STATE=$(oci compute instance get --instance-id "$INSTANCE_ID" --query 'data."lifecycle-state"' --raw-output 2>/dev/null)
             echo "[$((i*5))s] State: $STATE"
             if [ "$STATE" = "RUNNING" ]; then
               break
@@ -153,13 +153,13 @@ jobs:
           VNIC_ID=$(oci compute vnic-attachment list \
             --compartment-id "$TENANCY" \
             --instance-id "$INSTANCE_ID" \
-            --query 'data[0].vnic_id' --raw-output 2>/dev/null)
+            --query 'data[0]."vnic-id"' --raw-output 2>/dev/null)
           PUBLIC_IP=$(oci network vnic get \
             --vnic-id "$VNIC_ID" \
-            --query 'data.public_ip' --raw-output 2>/dev/null)
+            --query 'data."public-ip"' --raw-output 2>/dev/null)
           PRIVATE_IP=$(oci network vnic get \
             --vnic-id "$VNIC_ID" \
-            --query 'data.private_ip' --raw-output 2>/dev/null)
+            --query 'data."private-ip"' --raw-output 2>/dev/null)
 
           echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
           echo "private_ip=$PRIVATE_IP" >> $GITHUB_OUTPUT
