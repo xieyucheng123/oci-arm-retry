@@ -76,7 +76,8 @@ jobs:
               json.dump({'ssh_authorized_keys': ssh_key}, f)
           "
 
-          # Try to launch
+          # Try to launch (allow failure to capture error)
+          set +e
           LAUNCH_OUTPUT=$(oci compute instance launch \
             --compartment-id "$TENANCY" \
             --availability-domain "$AD_NAME" \
@@ -88,6 +89,7 @@ jobs:
             --assign-public-ip true \
             --metadata file:///tmp/metadata.json 2>&1)
           LAUNCH_EXIT=$?
+          set -e
 
           if [ $LAUNCH_EXIT -eq 0 ]; then
             INSTANCE_ID=$(echo "$LAUNCH_OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['id'])")
