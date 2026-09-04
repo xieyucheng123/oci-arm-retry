@@ -2,7 +2,7 @@ name: Retry ARM Instance Creation
 
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '0 */6 * * *'
   workflow_dispatch:
 
 permissions:
@@ -13,6 +13,10 @@ permissions:
 jobs:
   retry-arm:
     runs-on: ubuntu-latest
+    timeout-minutes: 340
+    concurrency:
+      group: retry-arm
+      cancel-in-progress: false
     steps:
       - name: Install OCI CLI
         run: |
@@ -37,7 +41,7 @@ jobs:
         id: check
         run: |
           TENANCY="${{ secrets.OCI_CLI_TENANCY }}"
-          EXISTING=$(oci compute instance list --compartment-id "$TENANCY" --all --query 'data[?"display-name"==`vm-arm` && "lifecycle-state"==`RUNNING`] | length(@)' --raw-output 2>/dev/null || echo "0")
+          EXISTING=$(oci compute instance list --compartment-id "$TENANCY" --all --no-retry --query 'data[?"display-name"==`vm-arm` && "lifecycle-state"==`RUNNING`] | length(@)' --raw-output 2>/dev/null || echo "0")
           if [ "$EXISTING" != "0" ]; then
             echo "exists=true" >> $GITHUB_OUTPUT
             echo "vm-arm already running, skipping"
@@ -54,12 +58,13 @@ jobs:
             --compartment-id "$TENANCY" \
             --shape VM.Standard.A1.Flex \
             --all \
+            --no-retry \
             --query 'data[?contains("display-name",`Canonical-Ubuntu-24.04-aarch64`) && !contains("display-name",`Minimal`)] | sort_by(@, &"time-created") | [-1].id' \
             --raw-output)
           echo "image_id=$IMAGE_ID" >> $GITHUB_OUTPUT
           echo "Selected image: $IMAGE_ID"
 
-      - name: Try launch ARM instance
+      - name: Try launch ARM instance (30s poll loop, ~5.5h)
         if: steps.check.outputs.exists == 'false'
         id: launch
         run: |
@@ -67,6 +72,7 @@ jobs:
           AD_NAME="NhMH:AP-TOKYO-1-AD-1"
           SUBNET_ID="ocid1.subnet.oc1.ap-tokyo-1.aaaaaaaau2qogsvj4ripqfh6yljlczb637bi2vtbbprjbox67c2il52s36qa"
           IMAGE_ID="${{ steps.image.outputs.image_id }}"
+          MAX_ATTEMPTS=660
 
           # Write metadata to file
           python3 -c "
@@ -76,32 +82,10 @@ jobs:
               json.dump({'ssh_authorized_keys': ssh_key}, f)
           "
 
-          # Try to launch (allow failure to capture error)
-          set +e
-          LAUNCH_OUTPUT=$(oci compute instance launch \
-            --compartment-id "$TENANCY" \
-            --availability-domain "$AD_NAME" \
-            --shape "VM.Standard.A1.Flex" \
-            --shape-config '{"ocpus": 2, "memory-in-gbs": 12}' \
-            --display-name "vm-arm" \
-            --image-id "$IMAGE_ID" \
-            --subnet-id "$SUBNET_ID" \
-            --assign-public-ip true \
-            --metadata file:///tmp/metadata.json 2>&1)
-          LAUNCH_EXIT=$?
-          set -e
-
-          if [ $LAUNCH_EXIT -eq 0 ]; then
-            INSTANCE_ID=$(echo "$LAUNCH_OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['id'])")
-            echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
-            echo "status=success" >> $GITHUB_OUTPUT
-            echo "Instance launched: $INSTANCE_ID"
-          else
-            # OCI CLI errors have "ServiceError:" prefix before JSON
-            ERROR_JSON=$(echo "$LAUNCH_OUTPUT" | sed 's/^ServiceError://' | tr -d '\n' | python3 -c "
+          parse_error() {
+            echo "$1" | sed 's/^ServiceError://' | tr -d '\n' | python3 -c "
           import json,sys
           raw = sys.stdin.read().strip()
-          # Find the JSON part (starts with {)
           idx = raw.find('{')
           if idx >= 0:
               try:
@@ -111,25 +95,77 @@ jobs:
                   print(json.dumps({'code': 'Unknown', 'message': raw[:200]}))
           else:
               print(json.dumps({'code': 'Unknown', 'message': raw[:200]}))
-          " 2>/dev/null || echo '{"code":"Unknown","message":"Parse failed"}')
+          " 2>/dev/null || echo '{"code":"Unknown","message":"Parse failed"}'
+          }
 
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            echo "=== Attempt $i/$MAX_ATTEMPTS $(date -u +%FT%TZ) ==="
+
+            # Re-check: vm-arm may have appeared mid-run (manual create or prior run)
+            EXISTING=$(oci compute instance list --compartment-id "$TENANCY" --all --no-retry --query 'data[?"display-name"==`vm-arm` && "lifecycle-state"==`RUNNING`] | length(@)' --raw-output 2>/dev/null || echo "0")
+            if [ "$EXISTING" != "0" ]; then
+              echo "vm-arm already running, exiting loop"
+              echo "status=already_exists" >> $GITHUB_OUTPUT
+              break
+            fi
+
+            # Try to launch (allow failure to capture error; --no-retry so our loop controls the interval)
+            set +e
+            LAUNCH_OUTPUT=$(oci compute instance launch \
+              --compartment-id "$TENANCY" \
+              --availability-domain "$AD_NAME" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config '{"ocpus": 2, "memory-in-gbs": 12}' \
+              --display-name "vm-arm" \
+              --image-id "$IMAGE_ID" \
+              --subnet-id "$SUBNET_ID" \
+              --assign-public-ip true \
+              --metadata file:///tmp/metadata.json \
+              --no-retry 2>&1)
+            LAUNCH_EXIT=$?
+            set -e
+
+            if [ $LAUNCH_EXIT -eq 0 ]; then
+              INSTANCE_ID=$(echo "$LAUNCH_OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['id'])")
+              echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+              echo "status=success" >> $GITHUB_OUTPUT
+              echo "Instance launched: $INSTANCE_ID"
+              break
+            fi
+
+            ERROR_JSON=$(parse_error "$LAUNCH_OUTPUT")
             ERROR_CODE=$(echo "$ERROR_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('code','Unknown'))")
             ERROR_MSG=$(echo "$ERROR_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('message','No message'))")
+            echo "Attempt $i failed: $ERROR_CODE - $ERROR_MSG"
 
-            echo "error_code=$ERROR_CODE" >> $GITHUB_OUTPUT
-            echo "error_msg=$ERROR_MSG" >> $GITHUB_OUTPUT
-
-            if echo "$ERROR_CODE" | grep -qi "InternalError"; then
-              echo "status=no_capacity" >> $GITHUB_OUTPUT
-              echo "Out of host capacity, will retry next run"
-            elif echo "$ERROR_CODE" | grep -qi "TooManyRequests"; then
-              echo "status=rate_limited" >> $GITHUB_OUTPUT
-              echo "Rate limited, will retry next run"
-            else
-              echo "status=error" >> $GITHUB_OUTPUT
-              echo "Unexpected error: $ERROR_CODE - $ERROR_MSG"
+            if [ "$i" -eq "$MAX_ATTEMPTS" ]; then
+              echo "error_code=$ERROR_CODE" >> $GITHUB_OUTPUT
+              echo "error_msg=$ERROR_MSG" >> $GITHUB_OUTPUT
+              if echo "$ERROR_CODE" | grep -qi "InternalError"; then
+                echo "status=no_capacity" >> $GITHUB_OUTPUT
+              elif echo "$ERROR_CODE" | grep -qi "TooManyRequests"; then
+                echo "status=rate_limited" >> $GITHUB_OUTPUT
+              else
+                echo "status=error" >> $GITHUB_OUTPUT
+              fi
+              echo "Max attempts reached, exiting loop"
+              break
             fi
-          fi
+
+            if echo "$ERROR_CODE" | grep -qi "TooManyRequests"; then
+              echo "Rate limited, backing off 300s"
+              sleep 300
+            elif echo "$ERROR_CODE" | grep -qi "InternalError"; then
+              sleep $((30 + RANDOM % 10))
+            else
+              # Non-retryable error (auth, bad OCID, quota, etc.): stop immediately
+              echo "error_code=$ERROR_CODE" >> $GITHUB_OUTPUT
+              echo "error_msg=$ERROR_MSG" >> $GITHUB_OUTPUT
+              echo "status=error" >> $GITHUB_OUTPUT
+              echo "Non-retryable error, exiting loop"
+              break
+            fi
+          done
 
       - name: Wait for instance running and get IP
         if: steps.launch.outputs.status == 'success'
