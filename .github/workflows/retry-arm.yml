@@ -64,7 +64,7 @@ jobs:
           echo "image_id=$IMAGE_ID" >> $GITHUB_OUTPUT
           echo "Selected image: $IMAGE_ID"
 
-      - name: Try launch ARM instance (30s poll loop, ~5.5h)
+      - name: Try launch ARM instance (150s poll loop, ~5.5h)
         if: steps.check.outputs.exists == 'false'
         id: launch
         run: |
@@ -72,7 +72,10 @@ jobs:
           AD_NAME="NhMH:AP-TOKYO-1-AD-1"
           SUBNET_ID="ocid1.subnet.oc1.ap-tokyo-1.aaaaaaaau2qogsvj4ripqfh6yljlczb637bi2vtbbprjbox67c2il52s36qa"
           IMAGE_ID="${{ steps.image.outputs.image_id }}"
-          MAX_ATTEMPTS=660
+          # 150s base interval keeps us under OCI LaunchInstance rate limits.
+          # 120 attempts x ~165s ≈ 5.5h, fits in the 340min job timeout.
+          MAX_ATTEMPTS=120
+          SLEEP_BASE=150
 
           # Write metadata to file
           python3 -c "
@@ -99,7 +102,16 @@ jobs:
           }
 
           for i in $(seq 1 $MAX_ATTEMPTS); do
-            echo "=== Attempt $i/$MAX_ATTEMPTS $(date -u +%FT%TZ) ==="
+            # Alternate shapes: odd attempts try 2C/12G, even attempts fall back
+            # to 1C/6G to catch fragment capacity, then scale up later.
+            if [ $((i % 2)) -eq 0 ]; then
+              SHAPE_CONFIG='{"ocpus": 1, "memory-in-gbs": 6}'
+              SHAPE_LABEL='1 OCPU / 6GB'
+            else
+              SHAPE_CONFIG='{"ocpus": 2, "memory-in-gbs": 12}'
+              SHAPE_LABEL='2 OCPU / 12GB'
+            fi
+            echo "=== Attempt $i/$MAX_ATTEMPTS $(date -u +%FT%TZ) [$SHAPE_LABEL] ==="
 
             # Re-check: vm-arm may have appeared mid-run (manual create or prior run)
             EXISTING=$(oci compute instance list --compartment-id "$TENANCY" --all --no-retry --query 'data[?"display-name"==`vm-arm` && "lifecycle-state"==`RUNNING`] | length(@)' --raw-output 2>/dev/null || echo "0")
@@ -115,7 +127,7 @@ jobs:
               --compartment-id "$TENANCY" \
               --availability-domain "$AD_NAME" \
               --shape "VM.Standard.A1.Flex" \
-              --shape-config '{"ocpus": 2, "memory-in-gbs": 12}' \
+              --shape-config "$SHAPE_CONFIG" \
               --display-name "vm-arm" \
               --image-id "$IMAGE_ID" \
               --subnet-id "$SUBNET_ID" \
@@ -128,8 +140,9 @@ jobs:
             if [ $LAUNCH_EXIT -eq 0 ]; then
               INSTANCE_ID=$(echo "$LAUNCH_OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['id'])")
               echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+              echo "shape_label=$SHAPE_LABEL" >> $GITHUB_OUTPUT
               echo "status=success" >> $GITHUB_OUTPUT
-              echo "Instance launched: $INSTANCE_ID"
+              echo "Instance launched ($SHAPE_LABEL): $INSTANCE_ID"
               break
             fi
 
@@ -145,6 +158,10 @@ jobs:
                 echo "status=no_capacity" >> $GITHUB_OUTPUT
               elif echo "$ERROR_CODE" | grep -qi "TooManyRequests"; then
                 echo "status=rate_limited" >> $GITHUB_OUTPUT
+              elif echo "$ERROR_CODE" | grep -qi "Unknown"; then
+                # Empty/unparsed output (e.g. CLI timeout): treat as retryable,
+                # don't spam error issues.
+                echo "status=no_capacity" >> $GITHUB_OUTPUT
               else
                 echo "status=error" >> $GITHUB_OUTPUT
               fi
@@ -153,10 +170,14 @@ jobs:
             fi
 
             if echo "$ERROR_CODE" | grep -qi "TooManyRequests"; then
-              echo "Rate limited, backing off 300s"
-              sleep 300
+              BACKOFF=$((300 + RANDOM % 60))
+              echo "Rate limited, backing off ${BACKOFF}s"
+              sleep $BACKOFF
             elif echo "$ERROR_CODE" | grep -qi "InternalError"; then
-              sleep $((30 + RANDOM % 10))
+              sleep $((SLEEP_BASE + RANDOM % 30))
+            elif echo "$ERROR_CODE" | grep -qi "Unknown"; then
+              # Transient CLI/network hiccup, retry with normal interval
+              sleep $((SLEEP_BASE + RANDOM % 30))
             else
               # Non-retryable error (auth, bad OCID, quota, etc.): stop immediately
               echo "error_code=$ERROR_CODE" >> $GITHUB_OUTPUT
@@ -213,6 +234,7 @@ jobs:
             const publicIp = '${{ steps.ip.outputs.public_ip }}';
             const privateIp = '${{ steps.ip.outputs.private_ip }}';
             const instanceId = '${{ steps.launch.outputs.instance_id }}';
+            const shapeLabel = '${{ steps.launch.outputs.shape_label }}' || '2 OCPU / 12GB';
 
             await github.rest.issues.create({
               owner: context.repo.owner,
@@ -226,7 +248,7 @@ jobs:
                 `| Instance ID | \`${instanceId}\` |`,
                 `| Public IP | \`${publicIp}\` |`,
                 `| Private IP | \`${privateIp}\` |`,
-                `| Shape | VM.Standard.A1.Flex (2 OCPU / 12GB) |`,
+                `| Shape | VM.Standard.A1.Flex (${shapeLabel}) |`,
                 `| Region | ap-tokyo-1 |`,
                 `| Image | Ubuntu 24.04 aarch64 |`,
                 '',
