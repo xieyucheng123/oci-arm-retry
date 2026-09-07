@@ -13,7 +13,7 @@ permissions:
 jobs:
   retry-arm:
     runs-on: ubuntu-latest
-    timeout-minutes: 340
+    timeout-minutes: 355
     concurrency:
       group: retry-arm
       cancel-in-progress: false
@@ -64,7 +64,7 @@ jobs:
           echo "image_id=$IMAGE_ID" >> $GITHUB_OUTPUT
           echo "Selected image: $IMAGE_ID"
 
-      - name: Try launch ARM instance (150s poll loop, ~5.5h)
+      - name: Try launch ARM instance (100s poll loop, ~6h, 200 attempts)
         if: steps.check.outputs.exists == 'false'
         id: launch
         run: |
@@ -72,10 +72,11 @@ jobs:
           AD_NAME="NhMH:AP-TOKYO-1-AD-1"
           SUBNET_ID="ocid1.subnet.oc1.ap-tokyo-1.aaaaaaaau2qogsvj4ripqfh6yljlczb637bi2vtbbprjbox67c2il52s36qa"
           IMAGE_ID="${{ steps.image.outputs.image_id }}"
-          # 150s base interval keeps us under OCI LaunchInstance rate limits.
-          # 120 attempts x ~165s ≈ 5.5h, fits in the 340min job timeout.
-          MAX_ATTEMPTS=120
-          SLEEP_BASE=150
+          # ~100s base interval: 200 attempts x ~105s ≈ 5.8h, fits in the
+          # 355min job timeout. Existence re-check runs every 10th attempt
+          # to halve API usage and stay clear of rate limits.
+          MAX_ATTEMPTS=200
+          SLEEP_BASE=90
 
           # Write metadata to file
           python3 -c "
@@ -113,12 +114,15 @@ jobs:
             fi
             echo "=== Attempt $i/$MAX_ATTEMPTS $(date -u +%FT%TZ) [$SHAPE_LABEL] ==="
 
-            # Re-check: vm-arm may have appeared mid-run (manual create or prior run)
-            EXISTING=$(oci compute instance list --compartment-id "$TENANCY" --all --no-retry --query 'data[?"display-name"==`vm-arm` && "lifecycle-state"==`RUNNING`] | length(@)' --raw-output 2>/dev/null || echo "0")
-            if [ "$EXISTING" != "0" ]; then
-              echo "vm-arm already running, exiting loop"
-              echo "status=already_exists" >> $GITHUB_OUTPUT
-              break
+            # Re-check every 10th attempt: vm-arm may have appeared mid-run
+            # (manual create or prior run). Skipped otherwise to save API quota.
+            if [ $((i % 10)) -eq 1 ]; then
+              EXISTING=$(oci compute instance list --compartment-id "$TENANCY" --all --no-retry --query 'data[?"display-name"==`vm-arm` && "lifecycle-state"==`RUNNING`] | length(@)' --raw-output 2>/dev/null || echo "0")
+              if [ "$EXISTING" != "0" ]; then
+                echo "vm-arm already running, exiting loop"
+                echo "status=already_exists" >> $GITHUB_OUTPUT
+                break
+              fi
             fi
 
             # Try to launch (allow failure to capture error; --no-retry so our loop controls the interval)
@@ -174,10 +178,10 @@ jobs:
               echo "Rate limited, backing off ${BACKOFF}s"
               sleep $BACKOFF
             elif echo "$ERROR_CODE" | grep -qi "InternalError"; then
-              sleep $((SLEEP_BASE + RANDOM % 30))
+              sleep $((SLEEP_BASE + RANDOM % 20))
             elif echo "$ERROR_CODE" | grep -qi "Unknown"; then
               # Transient CLI/network hiccup, retry with normal interval
-              sleep $((SLEEP_BASE + RANDOM % 30))
+              sleep $((SLEEP_BASE + RANDOM % 20))
             else
               # Non-retryable error (auth, bad OCID, quota, etc.): stop immediately
               echo "error_code=$ERROR_CODE" >> $GITHUB_OUTPUT
