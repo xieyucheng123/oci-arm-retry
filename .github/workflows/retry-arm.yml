@@ -64,7 +64,7 @@ jobs:
           echo "image_id=$IMAGE_ID" >> $GITHUB_OUTPUT
           echo "Selected image: $IMAGE_ID"
 
-      - name: Try launch ARM instance (100s poll loop, ~6h, 200 attempts)
+      - name: Try launch ARM instance (120s poll loop, ~6h, 150 attempts)
         if: steps.check.outputs.exists == 'false'
         id: launch
         run: |
@@ -72,11 +72,11 @@ jobs:
           AD_NAME="NhMH:AP-TOKYO-1-AD-1"
           SUBNET_ID="ocid1.subnet.oc1.ap-tokyo-1.aaaaaaaau2qogsvj4ripqfh6yljlczb637bi2vtbbprjbox67c2il52s36qa"
           IMAGE_ID="${{ steps.image.outputs.image_id }}"
-          # ~100s base interval: 200 attempts x ~105s ≈ 5.8h, fits in the
+          # ~135s base interval: 150 attempts x ~140s ≈ 5.8h, fits in the
           # 355min job timeout. Existence re-check runs every 10th attempt
           # to halve API usage and stay clear of rate limits.
-          MAX_ATTEMPTS=200
-          SLEEP_BASE=90
+          MAX_ATTEMPTS=150
+          SLEEP_BASE=120
 
           # Write metadata to file
           python3 -c "
@@ -178,10 +178,10 @@ jobs:
               echo "Rate limited, backing off ${BACKOFF}s"
               sleep $BACKOFF
             elif echo "$ERROR_CODE" | grep -qi "InternalError"; then
-              sleep $((SLEEP_BASE + RANDOM % 20))
+              sleep $((SLEEP_BASE + RANDOM % 30))
             elif echo "$ERROR_CODE" | grep -qi "Unknown"; then
               # Transient CLI/network hiccup, retry with normal interval
-              sleep $((SLEEP_BASE + RANDOM % 20))
+              sleep $((SLEEP_BASE + RANDOM % 30))
             else
               # Non-retryable error (auth, bad OCID, quota, etc.): stop immediately
               echo "error_code=$ERROR_CODE" >> $GITHUB_OUTPUT
