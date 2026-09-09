@@ -1,0 +1,199 @@
+name: Rotate Egress IPs (4h, rolling, dedup)
+
+# 出站 IP 池轮换：3 路滚动、4 小时换一路、去重防抽回旧 IP。
+# 入站主 IP (PROTECTED_IP) 碰都不碰，proxy.xieyucheng.top 全程不动。
+# 与 retry-arm.yml 相互独立：不同文件、不同 cron、不同 concurrency group。
+
+on:
+  schedule:
+    # 每 4 小时一轮，分钟错开 retry-arm(整点)，避免 API 叠加
+    - cron: '17 */4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  rotate-egress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: rotate-egress
+      cancel-in-progress: false
+    env:
+      INSTANCE_DISPLAY_NAME: vm-proxy
+      PROTECTED_IP: 168.110.36.240
+      EGRESS_COUNT: 3
+      HISTORY_FILE: .github/egress-ip-history.json
+      HISTORY_KEEP: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OCI CLI
+        run: pip install oci-cli --quiet
+
+      - name: Configure OCI CLI
+        run: |
+          mkdir -p ~/.oci
+          cat > ~/.oci/config << 'EOF'
+          [DEFAULT]
+          user=${{ secrets.OCI_CLI_USER }}
+          fingerprint=${{ secrets.OCI_CLI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_CLI_TENANCY }}
+          region=${{ secrets.OCI_CLI_REGION }}
+          key_file=~/.oci/oci_api_key.pem
+          EOF
+          echo "${{ secrets.OCI_CLI_KEY_CONTENT }}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/config
+
+      - name: Rotate one egress IP (rolling, dedup)
+        run: |
+          set -e
+          TENANCY="${{ secrets.OCI_CLI_TENANCY }}"
+          REGION="${{ secrets.OCI_CLI_REGION }}"
+
+          echo "=== locate instance $INSTANCE_DISPLAY_NAME ==="
+          INSTANCE_ID=$(oci compute instance list \
+            --compartment-id "$TENANCY" --all --no-retry \
+            --query "data[?\"display-name\"=='$INSTANCE_DISPLAY_NAME' && \"lifecycle-state\"=='RUNNING'] | [0].id" \
+            --raw-output)
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
+            echo "::error::instance $INSTANCE_DISPLAY_NAME not RUNNING, skip"
+            exit 0
+          fi
+          echo "instance: $INSTANCE_ID"
+
+          echo "=== primary VNIC ==="
+          VNIC_ID=$(oci compute vnic-attachment list \
+            --compartment-id "$TENANCY" --instance-id "$INSTANCE_ID" --no-retry \
+            --query 'data[?is-primary==`true`] | [0]."vnic-id"' --raw-output)
+          echo "vnic: $VNIC_ID"
+
+          echo "=== ensure $EGRESS_COUNT secondary private IPs ==="
+          PRIV_IPS=$(oci network private-ip list --vnic-id "$VNIC_ID" --no-retry \
+            --query 'data[?is-primary==`false`].id' --raw-output || true)
+          # oci returns one id per line with --raw-output on list; normalize to array
+          mapfile -t PRIV_ARR <<< "$PRIV_IPS"
+          # filter empties/None
+          TMP=(); for p in "${PRIV_ARR[@]}"; do
+            if [ -n "$p" ] && [ "$p" != "None" ]; then TMP+=("$p"); fi
+          done
+          PRIV_ARR=("${TMP[@]}")
+          echo "existing secondary: ${#PRIV_ARR[@]}"
+
+          i=0
+          while [ "${#PRIV_ARR[@]}" -lt "$EGRESS_COUNT" ]; do
+            i=$((i+1))
+            echo "creating secondary private-ip #$i"
+            NEW_PRIV=$(oci network private-ip create --vnic-id "$VNIC_ID" \
+              --display-name "egress-$i" --no-retry \
+              --query 'data.id' --raw-output)
+            PRIV_ARR+=("$NEW_PRIV")
+            sleep 5
+          done
+
+          echo "=== list egress reserved public IPs (skip protected $PROTECTED_IP) ==="
+          PUB_JSON=$(oci network public-ip list --scope REGION \
+            --compartment-id "$TENANCY" --no-retry \
+            --query "data[?\"lifetime\"=='RESERVED' && \"lifecycle-state\"=='ASSIGNED' && \"ip-address\"!='$PROTECTED_IP']" \
+            --output json)
+          echo "$PUB_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'egress candidates: {len(d)}')"
+
+          # 只保留绑在上述 secondary 上的；取最老的一个轮换
+          VICTIM_ID=$(echo "$PUB_JSON" | python3 -c "
+          import json,sys
+          pubs=json.load(sys.stdin)
+          mine=set('''${PRIV_ARR[*]}'''.split())
+          cand=[p for p in pubs if p.get('private-ip-id') in mine]
+          cand.sort(key=lambda p: p.get('time-created',''))
+          print(cand[0]['id'] if cand else '')
+          ")
+          if [ -z "$VICTIM_ID" ]; then
+            echo "no egress public IP yet, assigning fresh ones to secondaries without public IP..."
+            for priv in "${PRIV_ARR[@]}"; do
+              HAS=$(echo "$PUB_JSON" | python3 -c "
+              import json,sys
+              pubs=json.load(sys.stdin)
+              print(sum(1 for p in pubs if p.get('private-ip-id')=='$priv'))
+              ")
+              if [ "$HAS" = "0" ]; then
+                echo "assign new reserved IP to $priv"
+                oci network public-ip create --compartment-id "$TENANCY" \
+                  --lifetime RESERVED --display-name "egress-$(date +%s)" \
+                  --private-ip-id "$priv" --no-retry --query 'data."ip-address"' --raw-output
+                sleep 5
+              fi
+            done
+            echo "initial assignment done, next run will rotate"
+            exit 0
+          fi
+          VICTIM_IP=$(echo "$PUB_JSON" | python3 -c "
+          import json,sys
+          pubs=json.load(sys.stdin)
+          print(next(p['ip-address'] for p in pubs if p['id']=='$VICTIM_ID'))
+          ")
+          VICTIM_PRIV=$(echo "$PUB_JSON" | python3 -c "
+          import json,sys
+          pubs=json.load(sys.stdin)
+          print(next(p['private-ip-id'] for p in pubs if p['id']=='$VICTIM_ID'))
+          ")
+          echo "rotating victim: $VICTIM_IP ($VICTIM_ID) on $VICTIM_PRIV"
+
+          echo "=== load history (dedup last $HISTORY_KEEP) ==="
+          HIST="[]"
+          if [ -f "$HISTORY_FILE" ]; then HIST=$(cat "$HISTORY_FILE"); fi
+          echo "$HIST" | python3 -c "import json,sys; print(f'history entries: {len(json.load(sys.stdin))}')"
+
+          NEW_IP=""
+          for try in 1 2 3 4 5; do
+            echo "--- attempt $try: delete $VICTIM_IP, create fresh ---"
+            oci network public-ip delete --public-ip-id "$VICTIM_ID" --force --no-retry || true
+            sleep 10
+            NEWDATA=$(oci network public-ip create --compartment-id "$TENANCY" \
+              --lifetime RESERVED --display-name "egress-$(date +%s)-$try" \
+              --private-ip-id "$VICTIM_PRIV" --no-retry \
+              --query '{id:id, ip:"ip-address"}' --output json)
+            NEW_IP=$(echo "$NEWDATA" | python3 -c "import json,sys; print(json.load(sys.stdin)['ip'])")
+            NEW_ID=$(echo "$NEWDATA" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+            echo "got: $NEW_IP ($NEW_ID)"
+            DUP=$(echo "$HIST" | python3 -c "
+            import json,sys
+            h=json.load(sys.stdin)
+            print('yes' if '$NEW_IP' in h or '$NEW_IP'=='$VICTIM_IP' else 'no')
+            ")
+            if [ "$DUP" = "no" ]; then
+              echo "fresh IP accepted: $NEW_IP"
+              VICTIM_ID="$NEW_ID"
+              VICTIM_IP="$NEW_IP"
+              break
+            fi
+            echo "duplicate ($NEW_IP), retry..."
+            VICTIM_ID="$NEW_ID"
+            VICTIM_IP="$NEW_IP"
+            sleep 10
+          done
+
+          echo "=== update history ==="
+          python3 - "$HISTORY_FILE" "$VICTIM_IP" "$HISTORY_KEEP" << 'EOF'
+          import json,sys
+          f,ip,keep=sys.argv[1],sys.argv[2],int(sys.argv[3])
+          try:
+            h=json.load(open(f))
+          except Exception:
+            h=[]
+          h.append(ip)
+          h=h[-keep:]
+          json.dump(h,open(f,'w'),indent=2)
+          print(f"history now: {h}")
+          EOF
+
+          echo "=== commit history ==="
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$HISTORY_FILE" || true
+          git diff --cached --quiet && echo "no history change" || {
+            git commit -m "egress rotation: $VICTIM_IP [skip ci]"
+            git push
+          }
+          echo "rotation done: -> $VICTIM_IP"
