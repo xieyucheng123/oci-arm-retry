@@ -174,7 +174,7 @@ jobs:
             sleep 10
           done
 
-          echo "=== update history ==="
+          echo "=== update history + map ==="
           python3 - "$HISTORY_FILE" "$VICTIM_IP" "$HISTORY_KEEP" << 'EOF'
           import json,sys
           f,ip,keep=sys.argv[1],sys.argv[2],int(sys.argv[3])
@@ -187,11 +187,28 @@ jobs:
           json.dump(h,open(f,'w'),indent=2)
           print(f"history now: {h}")
           EOF
+          python3 - "$VICTIM_PRIV" "$VICTIM_IP" << 'EOF'
+          import json,sys,datetime
+          priv,ip=sys.argv[1],sys.argv[2]
+          f='.github/egress-map.json'
+          try:
+            m=json.load(open(f))
+          except Exception:
+            m={'ports':{}}
+          for port,info in m.get('ports',{}).items():
+            if info.get('private')==priv:
+              info['egress']=ip
+          pool=[i.get('egress') for p,i in sorted(m.get('ports',{}).items()) if p!='443' and i.get('egress')]
+          m['egress-pool']=pool
+          m['updated']=datetime.date.today().isoformat()
+          json.dump(m,open(f,'w'),indent=2)
+          print(f"map updated: {priv} -> {ip}")
+          EOF
 
-          echo "=== commit history ==="
+          echo "=== commit history + map ==="
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "$HISTORY_FILE" || true
+          git add "$HISTORY_FILE" .github/egress-map.json || true
           git diff --cached --quiet && echo "no history change" || {
             git commit -m "egress rotation: $VICTIM_IP [skip ci]"
             git push
